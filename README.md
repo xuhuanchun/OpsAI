@@ -4,8 +4,6 @@ OpsAI is a lightweight CLI assistant for ops engineers, using LLMs to generate a
 
 OpsAI 是一个面向运维工程师的轻量级命令行助手，使用大模型生成和优化配置、脚本与代码文件，支持彩色 diff、写入前确认和自动备份。
 
-一个 Python 命令行工具：只做配置文件、脚本和代码文件的生成、修改和优化，并把结果保存为当前目录文件。
-
 ## 功能
 
 - 从 `config.toml` 读取模型配置
