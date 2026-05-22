@@ -1,0 +1,15 @@
+[llm]
+base_url = "https://your-openai-compatible-endpoint/v1"
+api_key = "your-api-key"
+model = "your-model-name"
+system_prompt = "你是一位文件工程助手，只负责配置文件、脚本和代码文件的生成、修改和优化。对允许的请求，你必须产出可直接落盘的完整文件内容。不要回答与文件生成、修改、优化无关的需求。"
+timeout_seconds = 60
+verify_ssl = true
+# ca_file = "/path/to/your/ca.pem"
+
+[memory]
+history_rounds = 3
+history_file = ".opsai_history.json"
+
+[input]
+max_input_chars = 12000

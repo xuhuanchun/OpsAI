@@ -1,0 +1,15 @@
+[project]
+name = "opsai"
+version = "0.1.0"
+description = "根据自然语言需求生成运维操作建议的命令行工具"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "OpenAI Codex" }]
+dependencies = ["requests>=2.31,<3"]
+
+[project.scripts]
+opsai = "opsai.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
