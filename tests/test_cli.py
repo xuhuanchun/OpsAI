@@ -13,11 +13,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from opsai.cli import (
+    FILE_OUTPUT_PROMPT,
     INTENT_SYSTEM_PROMPT,
+    build_result_report,
     build_file_diff_from_content,
     build_runtime_context,
     colorize_diff_text,
     default_config_candidates,
+    format_highlighted_label,
     format_processing_status,
     load_config,
     main,
@@ -210,9 +213,55 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(format_processing_status(0), "\r处理中(0秒)")
         self.assertEqual(format_processing_status(12), "\r处理中(12秒)")
 
+    def test_format_highlighted_label_with_force_color(self):
+        old_force_color = os.environ.get("FORCE_COLOR")
+        try:
+            os.environ["FORCE_COLOR"] = "1"
+            rendered = format_highlighted_label("DiffView", stream=sys.stdout)
+        finally:
+            if old_force_color is None:
+                os.environ.pop("FORCE_COLOR", None)
+            else:
+                os.environ["FORCE_COLOR"] = old_force_color
+
+        self.assertEqual(rendered, "\x1b[1m\x1b[36mDiffView\x1b[0m")
+
+    def test_format_highlighted_status_with_force_color(self):
+        old_force_color = os.environ.get("FORCE_COLOR")
+        try:
+            os.environ["FORCE_COLOR"] = "1"
+            rendered = format_highlighted_label(
+                "OpsAI已为您处理完成，耗时2秒。要点如下：",
+                stream=sys.stdout,
+            )
+        finally:
+            if old_force_color is None:
+                os.environ.pop("FORCE_COLOR", None)
+            else:
+                os.environ["FORCE_COLOR"] = old_force_color
+
+        self.assertEqual(
+            rendered,
+            "\x1b[1m\x1b[36mOpsAI已为您处理完成，耗时2秒。要点如下：\x1b[0m",
+        )
+
+    def test_report_header_is_stripped_from_visible_reply(self):
+        stripped = build_result_report(
+            "结果报告：\n操作类型：修改\n- 修改点：更新配置。",
+            Path("/tmp/demo.conf"),
+            True,
+            "修改配置",
+        )
+
+        self.assertEqual(stripped, "操作类型：修改\n- 修改点：更新配置。")
+
     def test_intent_prompt_allows_scripts_and_code_files(self):
         self.assertIn("编写 bash/python 脚本", INTENT_SYSTEM_PROMPT)
         self.assertIn("修改 .py/.sh/.js/.go 等代码文件", INTENT_SYSTEM_PROMPT)
+
+    def test_file_output_prompt_requires_script_usage_example(self):
+        self.assertIn("如果生成的是脚本", FILE_OUTPUT_PROMPT)
+        self.assertIn("使用示例", FILE_OUTPUT_PROMPT)
 
     def test_load_config_allows_missing_ca_file_when_verify_ssl_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,7 +315,7 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertFalse(history_exists)
 
-    def test_output_argument_is_required(self):
+    def test_file_argument_is_required(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "config.toml"
@@ -285,7 +334,35 @@ class CliTestCase(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(stdout, "")
-        self.assertIn("--output/-o 为必填项", stderr)
+        self.assertIn("-f/--file 为必填项", stderr)
+
+    def test_file_argument_cannot_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.toml"
+            config.write_text(
+                textwrap.dedent(
+                    """
+                    [llm]
+                    base_url = "http://127.0.0.1:1"
+                    api_key = "test-key"
+                    model = "test-model"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                config,
+                "-f",
+                "a.conf",
+                "-f",
+                "b.conf",
+                "生成 nginx 配置",
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("-f/--file 只能指定一次", stderr)
 
     def test_default_config_prefers_script_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,7 +394,7 @@ class CliTestCase(unittest.TestCase):
         responses = [
             self.intent_response("allow", "配置文件优化请求"),
             self.file_response(
-                "已生成优化版\n<opsai_write_file name=\"nginx.optimized.conf\">\nworker_processes auto;\n</opsai_write_file>"
+                "操作类型：修改\n- 修改点：将 worker_processes 设置为 auto。\n- 原因：让 worker 数量随 CPU 自动适配。\n<opsai_write_file>\nworker_processes auto;\n</opsai_write_file>"
             ),
         ]
         server, thread, requests_seen = self.serve(responses)
@@ -344,24 +421,20 @@ class CliTestCase(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                sample = root / "nginx.conf"
-                sample.write_text("A" * 80, encoding="utf-8")
-                existing = root / "nginx.optimized.conf"
-                existing.write_text("disk baseline\n", encoding="utf-8")
+                target = (root / "nginx.optimized.conf").resolve()
+                target.write_text("A" * 80, encoding="utf-8")
                 old_cwd = Path.cwd()
                 try:
                     os.chdir(root)
                     code, stdout, stderr = self.run_cli(
                         config,
                         "-f",
-                        str(sample),
-                        "-o",
-                        "nginx.optimized.conf",
-                        "优化附带 nginx.conf 并保存为 nginx.optimized.conf",
+                        str(target),
+                        "优化这个 nginx 配置",
                         confirm_text="y\n",
                     )
                     history = json.loads((root / ".opsai_history.json").read_text(encoding="utf-8"))
-                    saved = (root / "nginx.optimized.conf").read_text(encoding="utf-8")
+                    saved = target.read_text(encoding="utf-8")
                 finally:
                     os.chdir(old_cwd)
         finally:
@@ -369,12 +442,15 @@ class CliTestCase(unittest.TestCase):
 
         request_content = requests_seen[1]["messages"][-1]["content"]
         self.assertEqual(code, 0)
-        self.assertIn("--- a/nginx.conf", stdout)
-        self.assertIn("+++ b/nginx.optimized.conf", stdout)
-        self.assertNotIn("已生成优化版", stdout)
-        self.assertNotIn("-disk baseline", stdout)
-        self.assertIn("文件已保存: nginx.optimized.conf", stderr)
-        self.assertIn("文件: nginx.conf", request_content)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
+        self.assertIn("操作类型：修改", stdout)
+        self.assertIn(f"--- {target}", stdout)
+        self.assertIn(f"+++ {target}", stdout)
+        self.assertLess(stdout.index("DiffView"), stdout.index("OpsAI已为您处理完成，耗时"))
+        self.assertIn("文件已保存: ", stderr)
+        self.assertIn(str(target), stderr)
+        self.assertIn(f"目标文件: {target}", request_content)
         self.assertIn("已截断后注入", request_content)
         self.assertIn("内容因长度限制已截断", request_content)
         self.assertIn("附加输入摘要", history[-2]["content"])
@@ -385,7 +461,7 @@ class CliTestCase(unittest.TestCase):
         responses = [
             self.intent_response("allow", "基于附加输入生成配置"),
             self.file_response(
-                "已生成配置\n<opsai_write_file name=\"generated.conf\">\nline=1\n</opsai_write_file>"
+                "操作类型：新建\n- 要点：生成最小配置文件。\n- 内容：包含 line=1 作为示例。\n<opsai_write_file>\nline=1\n</opsai_write_file>"
             ),
         ]
         server, thread, requests_seen = self.serve(responses)
@@ -393,18 +469,19 @@ class CliTestCase(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = self.make_config(root, server.server_port)
+                target = (root / "generated.conf").resolve()
                 old_cwd = Path.cwd()
                 try:
                     os.chdir(root)
                     code, stdout, stderr = self.run_cli(
                         config,
-                        "-o",
-                        "generated.conf",
+                        "-f",
+                        str(target),
                         stdin_text="listen 80;\nserver_name _;\n",
                         stdin_isatty=False,
                         confirm_text="y\n",
                     )
-                    saved = (root / "generated.conf").read_text(encoding="utf-8")
+                    saved = target.read_text(encoding="utf-8")
                 finally:
                     os.chdir(old_cwd)
         finally:
@@ -412,21 +489,23 @@ class CliTestCase(unittest.TestCase):
 
         request_content = requests_seen[1]["messages"][-1]["content"]
         self.assertEqual(code, 0)
-        self.assertIn("--- a/stdin", stdout)
-        self.assertIn("+++ b/generated.conf", stdout)
-        self.assertNotIn("已生成配置", stdout)
-        self.assertIn("文件已保存: generated.conf", stderr)
-        self.assertIn("目标输出文件: generated.conf", request_content)
-        self.assertIn("请基于附加输入生成或优化文件，并保存为当前目录文件。", request_content)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
+        self.assertIn("操作类型：新建", stdout)
+        self.assertIn("--- /dev/null", stdout)
+        self.assertIn(f"+++ {target}", stdout)
+        self.assertIn(f"文件已保存: {target}", stderr)
+        self.assertIn(f"目标文件路径: {target}", request_content)
+        self.assertIn("请基于已提供内容生成或优化目标文件，并保存到指定路径。", request_content)
         self.assertIn("[stdin]", request_content)
         self.assertIn("listen 80;", request_content)
         self.assertEqual(saved, "line=1\n")
 
-    def test_save_file_in_current_directory(self):
+    def test_save_file_to_specified_path(self):
         responses = [
             self.intent_response("allow", "配置文件生成请求"),
             self.file_response(
-                "已生成配置\n<opsai_write_file name=\"demo.conf\">\nlisten 80;\n</opsai_write_file>"
+                "操作类型：新建\n- 要点：生成最小 nginx 配置。\n- 内容：写入 listen 80;。\n<opsai_write_file>\nlisten 80;\n</opsai_write_file>"
             ),
         ]
         server, thread, requests_seen = self.serve(responses)
@@ -434,17 +513,18 @@ class CliTestCase(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = self.make_config(root, server.server_port)
+                target = (root / "demo.conf").resolve()
                 old_cwd = Path.cwd()
                 try:
                     os.chdir(root)
                     code, stdout, stderr = self.run_cli(
                         config,
-                        "-o",
+                        "-f",
                         "demo.conf",
-                        "生成 nginx 配置并保存为 demo.conf",
+                        "生成 nginx 配置",
                         confirm_text="y\n",
                     )
-                    saved_content = (root / "demo.conf").read_text(encoding="utf-8")
+                    saved_content = target.read_text(encoding="utf-8")
                     history = json.loads((root / ".opsai_history.json").read_text(encoding="utf-8"))
                 finally:
                     os.chdir(old_cwd)
@@ -452,11 +532,12 @@ class CliTestCase(unittest.TestCase):
             self.shutdown(server, thread)
 
         self.assertEqual(code, 0)
-        self.assertIn("+++ b/demo.conf", stdout)
-        self.assertNotIn("已生成配置", stdout)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
+        self.assertIn(f"+++ {target}", stdout)
         self.assertEqual(saved_content, "listen 80;\n")
-        self.assertIn("是否继续？[y/N]", stderr)
-        self.assertIn("文件已保存: demo.conf", stderr)
+        self.assertIn("\n以下文件将被写入", stderr)
+        self.assertIn(f"文件已保存: {target}", stderr)
         self.assertFalse(requests_seen[1]["stream"])
         self.assertIn("文件处理结果", history[-1]["content"])
         self.assertNotIn("<opsai_write_file", history[-1]["content"])
@@ -470,7 +551,7 @@ class CliTestCase(unittest.TestCase):
         )
 
         self.assertIn("--- /dev/null", diff_text)
-        self.assertIn("+++ b/demo.conf", diff_text)
+        self.assertIn("+++ demo.conf", diff_text)
         self.assertIn("+worker_processes auto;", diff_text)
 
     def test_reject_non_config_request_by_intent(self):
@@ -480,10 +561,11 @@ class CliTestCase(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = self.make_config(root, server.server_port)
+                target = (root / "ignored.conf").resolve()
                 code, stdout, stderr = self.run_cli(
                     config,
-                    "-o",
-                    "ignored.conf",
+                    "-f",
+                    str(target),
                     "分析一下 nginx 502 日志",
                 )
         finally:
@@ -494,31 +576,43 @@ class CliTestCase(unittest.TestCase):
         self.assertIn("只支持配置文件、脚本或代码文件的生成、修改、优化", stderr)
         self.assertEqual(len(requests_seen), 1)
 
-    def test_reject_output_path_outside_current_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config = root / "config.toml"
-            config.write_text(
-                textwrap.dedent(
-                    """
-                    [llm]
-                    base_url = "http://127.0.0.1:1"
-                    api_key = "test-key"
-                    model = "test-model"
-                    """
-                ),
-                encoding="utf-8",
-            )
-            code, stdout, stderr = self.run_cli(
-                config,
-                "-o",
-                "/tmp/demo.conf",
-                "生成配置",
-            )
+    def test_save_file_outside_current_directory(self):
+        responses = [
+            self.intent_response("allow", "配置文件生成请求"),
+            self.file_response(
+                "操作类型：新建\n- 要点：生成示例配置。\n- 内容：写入 line=1。\n<opsai_write_file>\nline=1\n</opsai_write_file>"
+            ),
+        ]
+        server, thread, _requests_seen = self.serve(responses)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = self.make_config(root, server.server_port)
+                cwd_dir = root / "cwd"
+                cwd_dir.mkdir()
+                target = (root / "nested" / "demo.conf").resolve()
+                old_cwd = Path.cwd()
+                try:
+                    os.chdir(cwd_dir)
+                    code, stdout, stderr = self.run_cli(
+                        config,
+                        "-f",
+                        str(target),
+                        "生成配置",
+                        confirm_text="y\n",
+                    )
+                    saved = target.read_text(encoding="utf-8")
+                finally:
+                    os.chdir(old_cwd)
+        finally:
+            self.shutdown(server, thread)
 
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, "")
-        self.assertIn("拒绝写入当前目录之外的路径", stderr)
+        self.assertEqual(code, 0)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
+        self.assertIn(f"+++ {target}", stdout)
+        self.assertIn(f"文件已保存: {target}", stderr)
+        self.assertEqual(saved, "line=1\n")
 
     def test_ask_before_overwrite_existing_file(self):
         responses = [
@@ -532,7 +626,7 @@ class CliTestCase(unittest.TestCase):
                             "choices": [
                                 {
                                     "message": {
-                                        "content": "覆盖测试\n<opsai_write_file name=\"demo.txt\">\nnew\n</opsai_write_file>"
+                                        "content": "操作类型：修改\n- 修改点：覆盖旧内容。\n- 原因：验证取消写入流程。\n<opsai_write_file>\nnew\n</opsai_write_file>"
                                     }
                                 }
                             ]
@@ -546,16 +640,16 @@ class CliTestCase(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = self.make_config(root, server.server_port)
-                target = root / "demo.txt"
+                target = (root / "demo.txt").resolve()
                 target.write_text("old", encoding="utf-8")
                 old_cwd = Path.cwd()
                 try:
                     os.chdir(root)
                     code, stdout, stderr = self.run_cli(
                         config,
-                        "-o",
+                        "-f",
                         "demo.txt",
-                        "生成文件并保存为 demo.txt",
+                        "修改 demo.txt",
                         confirm_text="n\n",
                     )
                     current = target.read_text(encoding="utf-8")
@@ -565,18 +659,19 @@ class CliTestCase(unittest.TestCase):
             self.shutdown(server, thread)
 
         self.assertEqual(code, 0)
-        self.assertIn("--- /dev/null", stdout)
-        self.assertIn("+++ b/demo.txt", stdout)
-        self.assertNotIn("覆盖测试", stdout)
-        self.assertIn("是否继续？[y/N]", stderr)
-        self.assertIn("文件已取消: demo.txt", stderr)
+        self.assertIn(f"--- {target}", stdout)
+        self.assertIn(f"+++ {target}", stdout)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
+        self.assertIn("\n以下文件将被写入或覆盖：", stderr)
+        self.assertIn(f"文件已取消: {target}", stderr)
         self.assertEqual(current, "old")
 
     def test_overwrite_existing_file_creates_timestamp_backup(self):
         responses = [
             self.intent_response("allow", "配置文件生成请求"),
             self.file_response(
-                "覆盖测试\n<opsai_write_file name=\"demo.txt\">\nnew\n</opsai_write_file>"
+                "操作类型：修改\n- 修改点：将内容替换为 new。\n- 原因：验证备份流程。\n<opsai_write_file>\nnew\n</opsai_write_file>"
             ),
         ]
         server, thread, _requests_seen = self.serve(responses)
@@ -584,16 +679,16 @@ class CliTestCase(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 config = self.make_config(root, server.server_port)
-                target = root / "demo.txt"
+                target = (root / "demo.txt").resolve()
                 target.write_text("old\n", encoding="utf-8")
                 old_cwd = Path.cwd()
                 try:
                     os.chdir(root)
                     code, stdout, stderr = self.run_cli(
                         config,
-                        "-o",
+                        "-f",
                         "demo.txt",
-                        "生成文件并保存为 demo.txt",
+                        "修改 demo.txt",
                         confirm_text="y\n",
                     )
                     current = target.read_text(encoding="utf-8")
@@ -606,13 +701,14 @@ class CliTestCase(unittest.TestCase):
             self.shutdown(server, thread)
 
         self.assertEqual(code, 0)
-        self.assertNotIn("覆盖测试", stdout)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("OpsAI已为您处理完成，耗时", stdout)
         self.assertEqual(current, "new\n")
         self.assertEqual(len(backups), 1)
         self.assertRegex(backup_name, r"^demo\.txt\.\d{14}\.bak$")
         self.assertEqual(backup_content, "old\n")
-        self.assertIn(f"已备份原文件: {backup_name}", stderr)
-        self.assertIn("文件已保存: demo.txt", stderr)
+        self.assertIn(f"已备份原文件: {backups[0].resolve()}", stderr)
+        self.assertIn(f"文件已保存: {target}", stderr)
 
 
 if __name__ == "__main__":

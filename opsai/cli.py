@@ -25,18 +25,24 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 INTENT_SYSTEM_PROMPT = (
     "你是一位低成本意图识别器。"
-    "只判断用户请求是否属于“配置文件、脚本或代码文件的生成、修改、优化，并预期保存为当前目录文件”。\n"
+    "只判断用户请求是否属于“配置文件、脚本或代码文件的生成、修改、优化，并预期保存为命令行 `-f/--file` 指定的单个文件路径”。\n"
     "允许的例子：生成 nginx.conf、修改现有 docker-compose.yml、优化 Kubernetes YAML、重写 systemd unit、补全 toml/ini/json/yaml 配置、编写 bash/python 脚本、修改 .py/.sh/.js/.go 等代码文件。\n"
-    "拒绝的例子：日志分析、故障排查建议、命令解释、通用问答、保存到当前目录之外的路径。\n"
+    "拒绝的例子：日志分析、故障排查建议、命令解释、通用问答。\n"
     "输出必须是严格 JSON，格式：{\"decision\":\"allow\"|\"reject\",\"reason\":\"一句简短原因\"}"
 )
 FILE_OUTPUT_PROMPT = (
-    "对于允许的请求，你必须在回答末尾追加且只追加一个文件块，严格使用如下格式：\n"
+    "对于允许的请求，你必须先输出结果报告，再在回答末尾追加且只追加一个文件块，严格使用如下格式：\n"
+    "结果报告要求：\n"
+    "1. 如果是修改已有文件，简洁列出修改点，并说明每一项这样修改的原因。\n"
+    "2. 如果是新建文件，简洁列出新建要点，并说明文件将包含的主要内容。\n"
+    "3. 如果生成的是脚本，结果报告里必须额外给出简洁可执行的使用示例。\n"
+    "4. 结果报告不要输出 diff，不要重复粘贴完整文件内容，也不要额外写“结果报告”标题。\n"
+    "文件块格式：\n"
     "<opsai_write_file>\n"
     "文件内容\n"
     "</opsai_write_file>\n"
     "限制：\n"
-    "1. 不要输出文件名，文件名由命令行参数 `--output` 指定。\n"
+    "1. 不要输出文件名，目标文件路径由命令行参数 `-f/--file` 指定。\n"
     "2. 如果用户要求修改已有文件，请输出修改后的完整文件内容，不要输出 diff。\n"
     "3. 不要输出与文件生成、修改、优化无关的建议性内容。"
 )
@@ -75,6 +81,7 @@ COMMON_COMMANDS = (
     "nginx",
 )
 ANSI_RESET = "\x1b[0m"
+ANSI_BOLD = "\x1b[1m"
 ANSI_DIM = "\x1b[2m"
 ANSI_RED = "\x1b[31m"
 ANSI_GREEN = "\x1b[32m"
@@ -118,9 +125,9 @@ class FileWriteRequest:
 
 @dataclass
 class FileWriteResult:
-    name: str
+    path: str
     status: str
-    backup_name: str | None = None
+    backup_path: str | None = None
 
 
 @dataclass
@@ -137,32 +144,40 @@ class ProcessingTimer:
     def __init__(self) -> None:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._started = False
+        self._started_at: float | None = None
+        self._elapsed_seconds = 0
 
     def start(self) -> None:
+        if self._started_at is not None:
+            return
+        self._stop_event = threading.Event()
+        self._started_at = time.monotonic()
         if not should_render_processing_timer():
             return
-        if self._started:
-            return
-        self._started = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        if not self._started:
+        if self._started_at is None:
             return
+        self._elapsed_seconds = max(0, int(time.monotonic() - self._started_at))
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
-        print("\r" + " " * 32 + "\r", end="", file=sys.stderr, flush=True)
-        self._started = False
+            print("\r" + " " * 32 + "\r", end="", file=sys.stderr, flush=True)
+        self._thread = None
+        self._started_at = None
+
+    @property
+    def elapsed_seconds(self) -> int:
+        if self._started_at is not None:
+            return max(0, int(time.monotonic() - self._started_at))
+        return self._elapsed_seconds
 
     def _run(self) -> None:
-        started_at = time.monotonic()
         while not self._stop_event.is_set():
-            elapsed = max(0, int(time.monotonic() - started_at))
             print(
-                format_processing_status(elapsed),
+                format_processing_status(self.elapsed_seconds),
                 end="",
                 file=sys.stderr,
                 flush=True,
@@ -175,6 +190,20 @@ def should_render_processing_timer() -> bool:
     if os.environ.get("FORCE_COLOR"):
         return True
     return bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+
+def use_color_stream(stream: object) -> bool:
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def format_highlighted_label(text: str, *, stream: object) -> str:
+    if not use_color_stream(stream):
+        return text
+    return f"{ANSI_BOLD}{ANSI_CYAN}{text}{ANSI_RESET}"
 
 
 def default_config_candidates() -> list[Path]:
@@ -233,13 +262,7 @@ def parse_args() -> argparse.Namespace:
         "--file",
         action="append",
         default=[],
-        help="读取文件内容并一并发送给模型，可重复使用。",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default=None,
-        help="输出文件名，只允许当前目录下的单个文件名。",
+        help="目标文件路径。必须且只能指定一次；文件存在时作为输入基线并在确认后写回，不存在时新建。",
     )
     parser.add_argument(
         "--max-input-chars",
@@ -372,15 +395,14 @@ def build_messages(
 
 def build_intent_messages(
     user_prompt: str,
-    output_name: str,
-    file_paths: list[str],
+    target_path: Path,
+    target_exists: bool,
     stdin_content: str,
 ) -> list[dict[str, str]]:
-    file_names = [Path(path).name for path in file_paths]
     details = [
         f"用户需求: {user_prompt}",
-        f"目标输出文件: {output_name}",
-        f"附加文件名: {', '.join(file_names) if file_names else '无'}",
+        f"目标文件路径: {target_path}",
+        f"目标文件是否已存在: {'是' if target_exists else '否'}",
         f"是否提供 stdin: {'是' if bool(stdin_content) else '否'}",
     ]
     return [
@@ -403,13 +425,12 @@ def truncate_text(text: str, limit: int) -> tuple[str, bool]:
     return f"{text[:head]}{marker}{text[-tail:]}", True
 
 
-def read_file_content(file_path: str) -> tuple[str, str]:
-    path = Path(file_path).expanduser().resolve()
+def read_file_content(path: Path) -> tuple[str, str]:
     if not path.exists():
         raise ValueError(f"文件不存在: {path}")
     if not path.is_file():
         raise ValueError(f"不是普通文件: {path}")
-    return path.name, path.read_bytes().decode("utf-8", errors="replace")
+    return str(path), path.read_bytes().decode("utf-8", errors="replace")
 
 
 def read_stdin_content() -> str:
@@ -419,20 +440,20 @@ def read_stdin_content() -> str:
 
 
 def build_attachments(
-    file_paths: list[str],
+    target_path: Path,
     stdin_content: str,
     max_input_chars: int,
 ) -> list[InputAttachment]:
-    sources: list[tuple[str, str]] = []
-    for file_path in file_paths:
-        name, content = read_file_content(file_path)
-        sources.append((f"文件: {name}", content))
+    sources: list[tuple[str, str, str]] = []
+    if target_path.exists():
+        source_name, content = read_file_content(target_path)
+        sources.append((source_name, f"目标文件: {source_name}", content))
     if stdin_content:
-        sources.append(("stdin", stdin_content))
+        sources.append(("stdin", "stdin", stdin_content))
 
     attachments: list[InputAttachment] = []
     remaining = max_input_chars
-    for label, content in sources:
+    for source_name, label, content in sources:
         original_chars = len(content)
         truncated_content, truncated = truncate_text(content, remaining)
         injected_chars = len(truncated_content)
@@ -441,7 +462,7 @@ def build_attachments(
             remaining -= injected_chars
         attachments.append(
             InputAttachment(
-                source_name=name if label.startswith("文件: ") else "stdin",
+                source_name=source_name,
                 label=label,
                 content=truncated_content,
                 full_content=content,
@@ -473,10 +494,10 @@ def summarize_attachments(attachments: list[InputAttachment]) -> str:
 
 def build_user_contents(
     user_prompt: str,
-    output_name: str,
+    target_path: Path,
     attachments: list[InputAttachment],
 ) -> tuple[str, str]:
-    prefix = f"目标输出文件: {output_name}\n用户需求: {user_prompt}"
+    prefix = f"目标文件路径: {target_path}\n用户需求: {user_prompt}"
     if not attachments:
         return prefix, prefix
 
@@ -513,20 +534,15 @@ def parse_intent_decision(text: str) -> IntentDecision:
     return IntentDecision(decision=decision, reason=reason.strip())
 
 
-def normalize_current_dir_filename(name: str) -> str:
-    candidate = name.strip().strip("\"'`")
-    candidate = candidate.replace("\\", "/")
-    if candidate.startswith("./"):
-        candidate = candidate[2:]
-    if not candidate or candidate in {".", ".."}:
-        raise ValueError(f"非法文件名: {name}")
-    if candidate.startswith("/") or candidate.startswith("../") or candidate.startswith("~"):
-        raise ValueError(f"拒绝写入当前目录之外的路径: {name}")
-    if re.match(r"^[A-Za-z]:/", candidate):
-        raise ValueError(f"拒绝写入当前目录之外的路径: {name}")
-    if "/" in candidate:
-        raise ValueError(f"拒绝写入当前目录之外的路径: {name}")
-    return candidate
+def resolve_target_path(path_text: str) -> Path:
+    candidate = path_text.strip().strip("\"'`")
+    if not candidate:
+        raise ValueError("目标文件路径不能为空")
+
+    path = Path(candidate).expanduser()
+    if path.name in {"", ".", ".."}:
+        raise ValueError(f"非法目标文件路径: {path_text}")
+    return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
 
 
 def extract_file_write_requests(reply: str) -> tuple[str, list[FileWriteRequest]]:
@@ -573,11 +589,12 @@ def confirm_apply_changes(paths: list[Path]) -> bool:
     if not paths:
         return True
 
-    names = "、".join(path.name for path in paths)
+    names = "、".join(str(path) for path in paths)
     if any(path.exists() for path in paths):
         prompt = f"以下文件将被写入或覆盖：{names}。是否继续？[y/N]: "
     else:
         prompt = f"以下文件将被写入：{names}。是否继续？[y/N]: "
+    prompt = "\n" + format_highlighted_label(prompt, stream=sys.stderr)
 
     while True:
         answer = read_confirmation_answer(prompt)
@@ -591,40 +608,16 @@ def confirm_apply_changes(paths: list[Path]) -> bool:
         print("请输入 y 或 n。", file=sys.stderr)
 
 
-def select_diff_baseline(
-    output_path: Path,
-    attachments: list[InputAttachment],
-) -> tuple[str, str] | None:
-    if not attachments:
+def read_diff_baseline(target_path: Path) -> tuple[str, str]:
+    if not target_path.exists():
         return "/dev/null", ""
-
-    exact_name_matches = [
-        attachment
-        for attachment in attachments
-        if attachment.source_name == output_path.name
-    ]
-    if len(exact_name_matches) == 1:
-        attachment = exact_name_matches[0]
-        return f"a/{attachment.source_name}", attachment.full_content
-
-    file_attachments = [
-        attachment
-        for attachment in attachments
-        if attachment.source_name != "stdin"
-    ]
-    if len(file_attachments) == 1 and len(attachments) == 1:
-        attachment = file_attachments[0]
-        return f"a/{attachment.source_name}", attachment.full_content
-
-    if len(attachments) == 1 and attachments[0].source_name == "stdin":
-        attachment = attachments[0]
-        return "a/stdin", attachment.full_content
-
-    return None
+    if not target_path.is_file():
+        raise ValueError(f"不是普通文件: {target_path}")
+    return str(target_path), target_path.read_bytes().decode("utf-8", errors="replace")
 
 
 def build_file_diff_from_content(
-    target_name: str,
+    target_label: str,
     fromfile: str,
     old_content: str,
     new_content: str,
@@ -634,12 +627,12 @@ def build_file_diff_from_content(
             old_content.splitlines(),
             new_content.splitlines(),
             fromfile=fromfile,
-            tofile=f"b/{target_name}",
+            tofile=target_label,
             lineterm="",
         )
     )
     if not diff_lines:
-        return f"--- {fromfile}\n+++ b/{target_name}\n@@ 无变更 @@"
+        return f"--- {fromfile}\n+++ {target_label}\n@@ 无变更 @@"
     return "\n".join(diff_lines)
 
 
@@ -724,11 +717,7 @@ def render_diff_text(diff_text: str) -> str:
 
 
 def use_color_output() -> bool:
-    if os.environ.get("FORCE_COLOR"):
-        return True
-    if os.environ.get("NO_COLOR"):
-        return False
-    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    return use_color_stream(sys.stdout)
 
 
 def colorize_diff_text(diff_text: str) -> str:
@@ -799,19 +788,59 @@ def colorize_diff_change_line(
 def print_file_diffs(
     requests: list[FileWriteRequest],
     output_path: Path,
-    attachments: list[InputAttachment],
 ) -> None:
     if len(requests) != 1:
         raise RuntimeError("模型必须只返回一个文件块。")
 
-    fromfile, old_content = select_diff_baseline(output_path, attachments)
+    fromfile, old_content = read_diff_baseline(output_path)
     diff_text = build_file_diff_from_content(
-        output_path.name,
+        str(output_path),
         fromfile,
         old_content,
         requests[0].content,
     )
+    print(format_highlighted_label("DiffView", stream=sys.stdout))
     print(colorize_diff_text(render_diff_text(diff_text)))
+
+
+def build_result_report(
+    report_text: str,
+    output_path: Path,
+    file_exists: bool,
+    user_prompt: str,
+) -> str:
+    cleaned = report_text.strip()
+    cleaned = re.sub(r"^\s*结果报告\s*[:：]?\s*\n*", "", cleaned, count=1)
+    if cleaned:
+        return cleaned
+
+    action = "修改" if file_exists else "新建"
+    reason = user_prompt or "满足当前文件生成或修改请求"
+    return "\n".join(
+        [
+            f"操作类型：{action}",
+            f"目标文件：{output_path}",
+            f"说明：本次将{action}目标文件，具体内容以 DIFF 与最终文件为准。",
+            f"原因：{reason}",
+        ]
+    )
+
+
+def print_result_report(
+    report_text: str,
+    output_path: Path,
+    file_exists: bool,
+    user_prompt: str,
+    elapsed_seconds: int,
+) -> None:
+    print()
+    print(
+        format_highlighted_label(
+            f"OpsAI已为您处理完成，耗时{elapsed_seconds}秒。要点如下：",
+            stream=sys.stdout,
+        )
+    )
+    print(build_result_report(report_text, output_path, file_exists, user_prompt))
 
 
 def save_generated_files(
@@ -823,23 +852,29 @@ def save_generated_files(
         raise RuntimeError("模型必须只返回一个文件块。")
 
     if not confirm_apply_changes([output_path]):
-        results.append(FileWriteResult(name=output_path.name, status="已取消"))
+        results.append(FileWriteResult(path=str(output_path), status="已取消"))
         return results
 
-    backup_name: str | None = None
+    if output_path.exists() and not output_path.is_file():
+        raise ValueError(f"不是普通文件: {output_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path_text: str | None = None
     if output_path.exists():
-        backup_name = f"{output_path.name}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
-        backup_path = output_path.with_name(backup_name)
+        backup_path = output_path.with_name(
+            f"{output_path.name}.{datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+        )
         if backup_path.exists():
-            raise RuntimeError(f"备份文件已存在: {backup_name}")
+            raise RuntimeError(f"备份文件已存在: {backup_path}")
         output_path.rename(backup_path)
+        backup_path_text = str(backup_path)
 
     output_path.write_text(requests[0].content, encoding="utf-8")
     results.append(
         FileWriteResult(
-            name=output_path.name,
+            path=str(output_path),
             status="已保存",
-            backup_name=backup_name,
+            backup_path=backup_path_text,
         )
     )
     return results
@@ -853,7 +888,7 @@ def build_assistant_history_content(reply: str, file_results: list[FileWriteResu
     if file_results:
         summary_lines = ["文件处理结果："]
         for result in file_results:
-            summary_lines.append(f"- {result.name}：{result.status}")
+            summary_lines.append(f"- {result.path}：{result.status}")
         parts.append("\n".join(summary_lines))
     return "\n\n".join(parts).strip()
 
@@ -995,14 +1030,18 @@ def call_model_non_stream(
 def detect_request_intent(
     config: AppConfig,
     user_prompt: str,
-    output_name: str,
-    file_paths: list[str],
+    target_path: Path,
     stdin_content: str,
     timer: ProcessingTimer | None = None,
 ) -> IntentDecision:
     reply = call_model_non_stream(
         config,
-        build_intent_messages(user_prompt, output_name, file_paths, stdin_content),
+        build_intent_messages(
+            user_prompt,
+            target_path,
+            target_path.exists(),
+            stdin_content,
+        ),
         print_reply=False,
         extra_body={"max_tokens": 80},
         timer=timer,
@@ -1040,30 +1079,31 @@ def main() -> int:
         print("错误: 请输入自然语言需求，或使用 --clear-context 清除上下文。", file=sys.stderr)
         return 1
     if not user_prompt:
-        user_prompt = "请基于附加输入生成或优化文件，并保存为当前目录文件。"
+        user_prompt = "请基于已提供内容生成或优化目标文件，并保存到指定路径。"
 
     if user_prompt in CLEAR_COMMANDS and not args.file and not stdin_content:
         clear_history(config.history_file)
         print("上下文已清除。")
         return 0
 
-    if not args.output:
-        print("错误: --output/-o 为必填项。", file=sys.stderr)
+    if not args.file:
+        print("错误: -f/--file 为必填项，且必须只指定一次。", file=sys.stderr)
+        return 1
+    if len(args.file) != 1:
+        print("错误: -f/--file 只能指定一次。", file=sys.stderr)
         return 1
     try:
-        output_filename = normalize_current_dir_filename(args.output)
+        output_path = resolve_target_path(args.file[0])
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
-    output_path = Path.cwd() / output_filename
 
     try:
         processing_timer = ProcessingTimer()
         intent = detect_request_intent(
             config,
             user_prompt,
-            output_filename,
-            args.file,
+            output_path,
             stdin_content,
             timer=processing_timer,
         )
@@ -1075,7 +1115,7 @@ def main() -> int:
     if intent.decision != "allow":
         processing_timer.stop()
         print(
-            "错误: 当前工具只支持配置文件、脚本或代码文件的生成、修改、优化，并保存为当前目录文件。"
+            "错误: 当前工具只支持配置文件、脚本或代码文件的生成、修改、优化，并保存到 -f/--file 指定的单个目标文件。"
             f"识别结果: {intent.reason}",
             file=sys.stderr,
         )
@@ -1083,7 +1123,7 @@ def main() -> int:
 
     try:
         attachments = build_attachments(
-            args.file,
+            output_path,
             stdin_content,
             max_input_chars,
         )
@@ -1094,7 +1134,7 @@ def main() -> int:
 
     request_user_content, history_user_content = build_user_contents(
         user_prompt,
-        output_filename,
+        output_path,
         attachments,
     )
 
@@ -1123,7 +1163,15 @@ def main() -> int:
         print("错误: 模型未返回可保存的文件内容。", file=sys.stderr)
         return 1
     processing_timer.stop()
-    print_file_diffs(file_write_requests, output_path, attachments)
+    output_exists = output_path.exists()
+    print_file_diffs(file_write_requests, output_path)
+    print_result_report(
+        visible_reply,
+        output_path,
+        output_exists,
+        user_prompt,
+        processing_timer.elapsed_seconds,
+    )
     try:
         file_results = save_generated_files(file_write_requests, output_path)
     except (RuntimeError, ValueError) as exc:
@@ -1131,9 +1179,9 @@ def main() -> int:
         return 1
 
     for result in file_results:
-        if result.backup_name:
-            print(f"已备份原文件: {result.backup_name}", file=sys.stderr)
-        print(f"文件{result.status}: {result.name}", file=sys.stderr)
+        if result.backup_path:
+            print(f"已备份原文件: {result.backup_path}", file=sys.stderr)
+        print(f"文件{result.status}: {result.path}", file=sys.stderr)
 
     updated_history = trim_history(
         [

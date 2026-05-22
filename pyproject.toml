@@ -1,6 +1,6 @@
 [project]
 name = "opsai"
-version = "0.1.0"
+version = "0.1.1"
 description = "根据自然语言需求生成运维操作建议的命令行工具"
 readme = "README.md"
 requires-python = ">=3.11"
