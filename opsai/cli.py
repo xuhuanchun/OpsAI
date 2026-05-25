@@ -1406,6 +1406,16 @@ def detect_request_intent(
 
 def main() -> int:
     args = parse_args()
+    user_prompt = " ".join(args.prompt).strip()
+    bypass_file_check = args.clear_context or user_prompt in CLEAR_COMMANDS
+    if not bypass_file_check:
+        if not args.file:
+            print("错误: -f/--file 为必填项，且必须只指定一次。", file=sys.stderr)
+            return 1
+        if len(args.file) != 1:
+            print("错误: -f/--file 只能指定一次。", file=sys.stderr)
+            return 1
+
     config_path = resolve_config_path(args.config)
 
     try:
@@ -1426,7 +1436,6 @@ def main() -> int:
 
     stdin_content = read_stdin_content()
 
-    user_prompt = " ".join(args.prompt).strip()
     if not user_prompt:
         try:
             user_prompt = read_interactive_user_prompt() or ""
@@ -1444,12 +1453,6 @@ def main() -> int:
         print("上下文已清除。")
         return 0
 
-    if not args.file:
-        print("错误: -f/--file 为必填项，且必须只指定一次。", file=sys.stderr)
-        return 1
-    if len(args.file) != 1:
-        print("错误: -f/--file 只能指定一次。", file=sys.stderr)
-        return 1
     try:
         output_path = resolve_target_path(args.file[0])
     except ValueError as exc:

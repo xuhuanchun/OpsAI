@@ -429,6 +429,17 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("-f/--file 为必填项", stderr)
 
+    def test_file_argument_is_checked_before_loading_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_config = root / "missing.toml"
+            code, stdout, stderr = self.run_cli(missing_config, "生成 nginx 配置")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("-f/--file 为必填项", stderr)
+        self.assertNotIn("未找到配置文件", stderr)
+
     def test_file_argument_cannot_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
