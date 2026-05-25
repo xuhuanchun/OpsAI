@@ -50,6 +50,8 @@ opsai --clear-context
 opsai --config /path/to/config.toml -f /etc/myapp/deploy.yaml "优化这个 Kubernetes Deployment"
 ```
 
+当省略自然语言需求参数时，程序会进入交互录入模式，并提示 `请录入需求（支持多行，ENTER 回行，CTRL-D 提交）：`；此时 `ENTER` 插入新行，按 `CTRL-D` 提交。
+
 ## 配置说明
 
 ```toml

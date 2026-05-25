@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tomllib
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ FILE_OUTPUT_PROMPT = (
     "3. 不要输出与文件生成、修改、优化无关的建议性内容。"
 )
 CLEAR_COMMANDS = {"/clear", "clear", "清除上下文"}
+INTERACTIVE_PROMPT_LABEL = "请录入需求（支持多行，ENTER 回行，CTRL-D 提交）："
 FILE_BLOCK_PATTERN = re.compile(
     r"<opsai_write_file(?:\s+name=\"[^\"]+\")?>(.*?)</opsai_write_file>",
     re.S,
@@ -585,6 +587,355 @@ def read_confirmation_answer(prompt: str) -> str | None:
     return None
 
 
+def measure_display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def count_rendered_lines(text: str, terminal_width: int) -> int:
+    width = max(terminal_width, 1)
+    line_count = 1
+    current_width = 0
+    for char in text:
+        if char == "\n":
+            line_count += 1
+            current_width = 0
+            continue
+        char_width = max(measure_display_width(char), 1)
+        if current_width and current_width + char_width > width:
+            line_count += 1
+            current_width = 0
+        current_width += char_width
+    return line_count
+
+
+def calculate_visual_cursor(text: str, terminal_width: int) -> tuple[int, int]:
+    width = max(terminal_width, 1)
+    line = 0
+    column = 0
+    for char in text:
+        if char == "\n":
+            line += 1
+            column = 0
+            continue
+        char_width = max(measure_display_width(char), 1)
+        if column and column + char_width > width:
+            line += 1
+            column = 0
+        column += char_width
+    return line, column
+
+
+def clear_rendered_lines(stream: object, line_count: int, cursor_line: int) -> None:
+    if line_count <= 0:
+        return
+    write = getattr(stream, "write")
+    write("\r")
+    for _ in range(cursor_line):
+        write("\x1b[1A")
+    for index in range(line_count):
+        write("\x1b[2K")
+        if index < line_count - 1:
+            write("\x1b[1B\r")
+    for _ in range(line_count - 1):
+        write("\x1b[1A")
+    write("\r")
+
+
+def render_multiline_editor(
+    prompt_text: str,
+    content: str,
+    cursor_index: int,
+    *,
+    stream: object,
+    previous_render_state: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    terminal_width = max(shutil.get_terminal_size(fallback=(80, 24)).columns, 20)
+    if previous_render_state is not None:
+        clear_rendered_lines(stream, previous_render_state[0], previous_render_state[1])
+    write = getattr(stream, "write")
+    write(prompt_text)
+    write("\r\n")
+    write(content.replace("\n", "\r\n"))
+    end_line, _end_column = calculate_visual_cursor(content, terminal_width)
+    cursor_line, cursor_column = calculate_visual_cursor(content[:cursor_index], terminal_width)
+    if end_line > cursor_line:
+        write(f"\x1b[{end_line - cursor_line}A")
+    write("\r")
+    if cursor_column > 0:
+        write(f"\x1b[{cursor_column}C")
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        flush()
+    return 1 + count_rendered_lines(content, terminal_width), 1 + cursor_line
+
+
+def read_editor_key(read_char) -> str | None:
+    char = read_char()
+    if char in {"", None}:
+        return ""
+    if char != "\x1b":
+        return char
+    starter = read_char()
+    if starter in {"", None}:
+        return "\x1b"
+    if starter not in {"[", "O"}:
+        return "\x1b"
+    tail = ""
+    while True:
+        char = read_char()
+        if char in {"", None}:
+            return "\x1b"
+        tail += char
+        if char.isalpha() or char == "~":
+            break
+    sequence = starter + tail
+    return {
+        "[A": "up",
+        "[B": "down",
+        "[C": "right",
+        "[D": "left",
+        "[H": "home",
+        "[F": "end",
+        "[1~": "home",
+        "[4~": "end",
+        "[7~": "home",
+        "[8~": "end",
+        "OH": "home",
+        "OF": "end",
+    }.get(sequence, "\x1b")
+
+
+def get_cursor_row_col(text: str, cursor_index: int) -> tuple[int, int]:
+    prefix = text[:cursor_index]
+    row = prefix.count("\n")
+    line_start = prefix.rfind("\n")
+    if line_start == -1:
+        return row, len(prefix)
+    return row, len(prefix) - line_start - 1
+
+
+def get_cursor_index_from_row_col(text: str, row: int, column: int) -> int:
+    lines = text.split("\n")
+    if not lines:
+        return 0
+    clamped_row = max(0, min(row, len(lines) - 1))
+    clamped_column = max(0, min(column, len(lines[clamped_row])))
+    index = 0
+    for current_row in range(clamped_row):
+        index += len(lines[current_row]) + 1
+    return index + clamped_column
+
+
+def collect_multiline_editor_text(
+    read_char,
+    *,
+    stream: object,
+    prompt_text: str,
+) -> str | None:
+    buffer: list[str] = []
+    cursor_index = 0
+    preferred_column: int | None = None
+    render_state = render_multiline_editor(
+        prompt_text,
+        "",
+        cursor_index,
+        stream=stream,
+    )
+    write = getattr(stream, "write")
+    flush = getattr(stream, "flush", None)
+
+    while True:
+        char = read_editor_key(read_char)
+        text = "".join(buffer)
+        if char in {"", None}:
+            if callable(flush):
+                flush()
+            return text.strip() or None
+        if char == "\x03":
+            clear_rendered_lines(stream, render_state[0], render_state[1])
+            write("^C\r\n")
+            if callable(flush):
+                flush()
+            raise KeyboardInterrupt
+        if char == "\x04":
+            clear_rendered_lines(stream, render_state[0], render_state[1])
+            write(prompt_text)
+            write("\r\n")
+            write(text.replace("\n", "\r\n"))
+            write("\r\n")
+            if callable(flush):
+                flush()
+            return text.strip() or None
+        if char == "left":
+            if cursor_index > 0:
+                cursor_index -= 1
+                preferred_column = None
+                render_state = render_multiline_editor(
+                    prompt_text,
+                    text,
+                    cursor_index,
+                    stream=stream,
+                    previous_render_state=render_state,
+                )
+            continue
+        if char == "right":
+            if cursor_index < len(buffer):
+                cursor_index += 1
+                preferred_column = None
+                render_state = render_multiline_editor(
+                    prompt_text,
+                    text,
+                    cursor_index,
+                    stream=stream,
+                    previous_render_state=render_state,
+                )
+            continue
+        if char == "home":
+            row, _column = get_cursor_row_col(text, cursor_index)
+            cursor_index = get_cursor_index_from_row_col(text, row, 0)
+            preferred_column = 0
+            render_state = render_multiline_editor(
+                prompt_text,
+                text,
+                cursor_index,
+                stream=stream,
+                previous_render_state=render_state,
+            )
+            continue
+        if char == "end":
+            row, _column = get_cursor_row_col(text, cursor_index)
+            cursor_index = get_cursor_index_from_row_col(text, row, len(text.split("\n")[row]))
+            preferred_column = None
+            render_state = render_multiline_editor(
+                prompt_text,
+                text,
+                cursor_index,
+                stream=stream,
+                previous_render_state=render_state,
+            )
+            continue
+        if char in {"up", "down"}:
+            row, column = get_cursor_row_col(text, cursor_index)
+            target_row = row - 1 if char == "up" else row + 1
+            target_column = column if preferred_column is None else preferred_column
+            next_index = get_cursor_index_from_row_col(text, target_row, target_column)
+            if next_index != cursor_index:
+                cursor_index = next_index
+                if preferred_column is None:
+                    preferred_column = column
+                render_state = render_multiline_editor(
+                    prompt_text,
+                    text,
+                    cursor_index,
+                    stream=stream,
+                    previous_render_state=render_state,
+                )
+            continue
+        preferred_column = None
+        if char in {"\x08", "\x7f"}:
+            if cursor_index <= 0:
+                continue
+            del buffer[cursor_index - 1]
+            cursor_index -= 1
+            render_state = render_multiline_editor(
+                prompt_text,
+                "".join(buffer),
+                cursor_index,
+                stream=stream,
+                previous_render_state=render_state,
+            )
+            continue
+        if char == "\r":
+            char = "\n"
+        if char == "\n":
+            buffer.insert(cursor_index, "\n")
+            cursor_index += 1
+            render_state = render_multiline_editor(
+                prompt_text,
+                "".join(buffer),
+                cursor_index,
+                stream=stream,
+                previous_render_state=render_state,
+            )
+            continue
+        if unicodedata.category(char) == "Cc":
+            continue
+        buffer.insert(cursor_index, char)
+        cursor_index += 1
+        render_state = render_multiline_editor(
+            prompt_text,
+            "".join(buffer),
+            cursor_index,
+            stream=stream,
+            previous_render_state=render_state,
+        )
+
+
+def read_native_multiline_editor(
+    input_stream: object,
+    *,
+    output_stream: object,
+    prompt_text: str,
+) -> str | None:
+    if os.name == "nt":
+        return collect_multiline_editor_text(
+            lambda: getattr(input_stream, "read")(1),
+            stream=output_stream,
+            prompt_text=prompt_text,
+        )
+
+    import termios
+    import tty
+
+    fd = getattr(input_stream, "fileno")()
+    original_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return collect_multiline_editor_text(
+            lambda: getattr(input_stream, "read")(1),
+            stream=output_stream,
+            prompt_text=prompt_text,
+        )
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
+
+
+def read_interactive_user_prompt() -> str | None:
+    prompt_text = format_highlighted_label(INTERACTIVE_PROMPT_LABEL, stream=sys.stderr)
+    if hasattr(sys.stdin, "read_interactive_text"):
+        print(prompt_text, file=sys.stderr, flush=True)
+        text = sys.stdin.read_interactive_text()
+        return text.strip() if text is not None else None
+    if sys.stdin.isatty():
+        return read_native_multiline_editor(
+            sys.stdin,
+            output_stream=sys.stderr,
+            prompt_text=prompt_text,
+        )
+
+    fallback_paths = ["/dev/tty"]
+    if os.name == "nt":
+        fallback_paths.insert(0, "CONIN$")
+
+    for path in fallback_paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as stream:
+                text = read_native_multiline_editor(
+                    stream,
+                    output_stream=sys.stderr,
+                    prompt_text=prompt_text,
+                )
+        except OSError:
+            continue
+        return text
+    return None
+
+
 def confirm_apply_changes(paths: list[Path]) -> bool:
     if not paths:
         return True
@@ -766,14 +1117,15 @@ def colorize_diff_change_line(
 ) -> str:
     match = re.match(r"^(\s*\d+)\s([+\-])\s(.*)$", line)
     if not match:
-        padded = line.ljust(terminal_width)
+        trailing_spaces = max(0, terminal_width - measure_display_width(line))
+        padded = f"{line}{' ' * trailing_spaces}"
         return f"{background}{ANSI_BLACK}{padded}{ANSI_RESET}"
 
     line_number = match.group(1)
     marker = match.group(2)
     content = match.group(3)
     plain_line = f"{line_number} {marker} {content}"
-    trailing_spaces = max(0, terminal_width - len(plain_line))
+    trailing_spaces = max(0, terminal_width - measure_display_width(plain_line))
     return (
         f"{background}"
         f"{ANSI_GRAY}{line_number}"
@@ -1075,11 +1427,17 @@ def main() -> int:
     stdin_content = read_stdin_content()
 
     user_prompt = " ".join(args.prompt).strip()
+    if not user_prompt:
+        try:
+            user_prompt = read_interactive_user_prompt() or ""
+        except KeyboardInterrupt:
+            return 130
     if not user_prompt and not args.file and not stdin_content:
         print("错误: 请输入自然语言需求，或使用 --clear-context 清除上下文。", file=sys.stderr)
         return 1
     if not user_prompt:
-        user_prompt = "请基于已提供内容生成或优化目标文件，并保存到指定路径。"
+        print("错误: 未录入自然语言需求。", file=sys.stderr)
+        return 1
 
     if user_prompt in CLEAR_COMMANDS and not args.file and not stdin_content:
         clear_history(config.history_file)

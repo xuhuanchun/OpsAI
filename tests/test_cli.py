@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import textwrap
@@ -11,6 +12,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 from opsai.cli import (
     FILE_OUTPUT_PROMPT,
@@ -19,11 +21,14 @@ from opsai.cli import (
     build_file_diff_from_content,
     build_runtime_context,
     colorize_diff_text,
+    colorize_diff_change_line,
+    collect_multiline_editor_text,
     default_config_candidates,
     format_highlighted_label,
     format_processing_status,
     load_config,
     main,
+    measure_display_width,
     render_diff_text,
     resolve_config_path,
 )
@@ -129,6 +134,7 @@ class CliTestCase(unittest.TestCase):
         stdin_text: str = "",
         stdin_isatty: bool = True,
         confirm_text: str = "",
+        interactive_text: str = "",
     ) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -136,9 +142,10 @@ class CliTestCase(unittest.TestCase):
         old_stdin = sys.stdin
 
         class FakeStdin(io.StringIO):
-            def __init__(self_inner, text: str, confirmation: str):
+            def __init__(self_inner, text: str, confirmation: str, interactive: str):
                 super().__init__(text)
                 self_inner._confirmation = io.StringIO(confirmation)
+                self_inner._interactive = io.StringIO(interactive)
 
             def isatty(self_inner):
                 return stdin_isatty
@@ -146,9 +153,12 @@ class CliTestCase(unittest.TestCase):
             def read_confirmation_line(self_inner):
                 return self_inner._confirmation.readline()
 
+            def read_interactive_text(self_inner):
+                return self_inner._interactive.read()
+
         sys.argv = ["opsai", "--config", str(config), *args]
         try:
-            sys.stdin = FakeStdin(stdin_text, confirm_text)
+            sys.stdin = FakeStdin(stdin_text, confirm_text, interactive_text)
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 code = main()
         finally:
@@ -194,6 +204,18 @@ class CliTestCase(unittest.TestCase):
         self.assertIn("\x1b[36m        @@ -1 +1 @@\x1b[0m", colored)
         self.assertIn("\x1b[48;5;224m\x1b[90m    1\x1b[30m \x1b[31m-\x1b[30m old", colored)
         self.assertIn("\x1b[48;5;194m\x1b[90m    1\x1b[30m \x1b[32m+\x1b[30m new", colored)
+
+    def test_colorize_diff_change_line_keeps_wide_comment_within_terminal_width(self):
+        terminal_width = measure_display_width("    1 + # 中文注释")
+        colored = colorize_diff_change_line(
+            "    1 + # 中文注释",
+            terminal_width=terminal_width,
+            background="\x1b[48;5;194m",
+            marker_color="\x1b[32m",
+        )
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", colored)
+
+        self.assertEqual(measure_display_width(plain), terminal_width)
 
     def test_render_diff_text_adds_line_numbers_without_blank_lines(self):
         rendered = render_diff_text(
@@ -244,6 +266,77 @@ class CliTestCase(unittest.TestCase):
             rendered,
             "\x1b[1m\x1b[36mOpsAI已为您处理完成，耗时2秒。要点如下：\x1b[0m",
         )
+
+    def test_collect_multiline_editor_text_supports_enter_and_ctrl_d(self):
+        chars = iter(["第", "一", "行", "\r", "第", "二", "行", "\x04"])
+        output = io.StringIO()
+
+        collected = collect_multiline_editor_text(
+            lambda: next(chars, ""),
+            stream=output,
+            prompt_text="请录入需求",
+        )
+
+        self.assertEqual(collected, "第一行\n第二行")
+        self.assertTrue(output.getvalue().endswith("请录入需求\r\n第一行\r\n第二行\r\n"))
+
+    def test_collect_multiline_editor_text_supports_arrow_keys(self):
+        chars = iter(
+            [
+                "a",
+                "b",
+                "c",
+                "d",
+                "\x1b",
+                "[",
+                "D",
+                "\x1b",
+                "[",
+                "D",
+                "X",
+                "\x1b",
+                "[",
+                "C",
+                "Y",
+                "\r",
+                "1",
+                "2",
+                "\x1b",
+                "[",
+                "A",
+                "\x1b",
+                "[",
+                "D",
+                "\x1b",
+                "[",
+                "B",
+                "Z",
+                "\x04",
+            ]
+        )
+        output = io.StringIO()
+
+        collected = collect_multiline_editor_text(
+            lambda: next(chars, ""),
+            stream=output,
+            prompt_text="请录入需求",
+        )
+
+        self.assertEqual(collected, "abXcY\n1Z2d")
+        self.assertTrue(output.getvalue().endswith("请录入需求\r\nabXcY\r\n1Z2d\r\n"))
+
+    def test_collect_multiline_editor_text_ctrl_c_exits(self):
+        chars = iter(["第", "一", "\x03"])
+        output = io.StringIO()
+
+        with self.assertRaises(KeyboardInterrupt):
+            collect_multiline_editor_text(
+                lambda: next(chars, ""),
+                stream=output,
+                prompt_text="请录入需求",
+            )
+
+        self.assertTrue(output.getvalue().endswith("^C\r\n"))
 
     def test_report_header_is_stripped_from_visible_reply(self):
         stripped = build_result_report(
@@ -390,6 +483,116 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(resolved, script_config.resolve())
         self.assertEqual(candidates[0], script_config.resolve())
 
+    def test_missing_prompt_reads_interactively(self):
+        model_messages: dict[str, object] = {}
+
+        def fake_detect_request_intent(*args, **kwargs):
+            return mock.Mock(decision="allow", reason="配置文件生成请求")
+
+        def fake_call_model_non_stream(_config, messages, **kwargs):
+            model_messages["messages"] = messages
+            return (
+                "操作类型：新建\n- 要点：生成最小配置文件。\n"
+                "<opsai_write_file>\nworker_processes auto;\n</opsai_write_file>"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.toml"
+            config.write_text(
+                textwrap.dedent(
+                    """
+                    [llm]
+                    base_url = "http://127.0.0.1:1"
+                    api_key = "test-key"
+                    model = "test-model"
+                    timeout_seconds = 5
+
+                    [memory]
+                    history_rounds = 3
+                    history_file = ".opsai_history.json"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            target = (root / "generated.conf").resolve()
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with mock.patch("opsai.cli.detect_request_intent", side_effect=fake_detect_request_intent), mock.patch(
+                    "opsai.cli.call_model_non_stream",
+                    side_effect=fake_call_model_non_stream,
+                ):
+                    code, stdout, stderr = self.run_cli(
+                        config,
+                        "-f",
+                        str(target),
+                        confirm_text="y\n",
+                        interactive_text="生成一个最小 nginx 配置",
+                    )
+                saved = target.read_text(encoding="utf-8")
+            finally:
+                os.chdir(old_cwd)
+
+        request_content = model_messages["messages"][-1]["content"]
+        self.assertEqual(code, 0)
+        self.assertIn("DiffView", stdout)
+        self.assertIn("请录入需求（支持多行，ENTER 回行，CTRL-D 提交）：", stderr)
+        self.assertIn(f"文件已保存: {target}", stderr)
+        self.assertIn("生成一个最小 nginx 配置", request_content)
+        self.assertNotIn("请基于已提供内容生成或优化目标文件，并保存到指定路径。", request_content)
+        self.assertEqual(saved, "worker_processes auto;\n")
+
+    def test_missing_prompt_requires_non_empty_interactive_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.toml"
+            config.write_text(
+                textwrap.dedent(
+                    """
+                    [llm]
+                    base_url = "http://127.0.0.1:1"
+                    api_key = "test-key"
+                    model = "test-model"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            code, stdout, stderr = self.run_cli(
+                config,
+                "-f",
+                "a.conf",
+                stdin_isatty=False,
+                interactive_text="",
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("请录入需求（支持多行，ENTER 回行，CTRL-D 提交）：", stderr)
+        self.assertIn("未录入自然语言需求", stderr)
+
+    def test_missing_prompt_ctrl_c_returns_130(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.toml"
+            config.write_text(
+                textwrap.dedent(
+                    """
+                    [llm]
+                    base_url = "http://127.0.0.1:1"
+                    api_key = "test-key"
+                    model = "test-model"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("opsai.cli.read_interactive_user_prompt", side_effect=KeyboardInterrupt):
+                code, stdout, stderr = self.run_cli(config, "-f", "a.conf")
+
+        self.assertEqual(code, 130)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "")
+
     def test_file_input_is_injected_and_history_only_keeps_summary(self):
         responses = [
             self.intent_response("allow", "配置文件优化请求"),
@@ -457,7 +660,7 @@ class CliTestCase(unittest.TestCase):
         self.assertNotIn("A" * 60, history[-2]["content"])
         self.assertEqual(saved, "worker_processes auto;\n")
 
-    def test_stdin_input_is_injected_with_default_prompt(self):
+    def test_stdin_input_is_injected_with_interactive_prompt(self):
         responses = [
             self.intent_response("allow", "基于附加输入生成配置"),
             self.file_response(
@@ -480,6 +683,7 @@ class CliTestCase(unittest.TestCase):
                         stdin_text="listen 80;\nserver_name _;\n",
                         stdin_isatty=False,
                         confirm_text="y\n",
+                        interactive_text="基于附加输入生成配置",
                     )
                     saved = target.read_text(encoding="utf-8")
                 finally:
@@ -496,7 +700,7 @@ class CliTestCase(unittest.TestCase):
         self.assertIn(f"+++ {target}", stdout)
         self.assertIn(f"文件已保存: {target}", stderr)
         self.assertIn(f"目标文件路径: {target}", request_content)
-        self.assertIn("请基于已提供内容生成或优化目标文件，并保存到指定路径。", request_content)
+        self.assertIn("基于附加输入生成配置", request_content)
         self.assertIn("[stdin]", request_content)
         self.assertIn("listen 80;", request_content)
         self.assertEqual(saved, "line=1\n")
